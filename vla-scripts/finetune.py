@@ -20,6 +20,7 @@ Run with:
 """
 
 import os
+import shutil
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,9 +121,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     torch.cuda.set_device(device_id := distributed_state.local_process_index)
     torch.cuda.empty_cache()
 
-    # Configure Unique Experiment ID & Log Directory
+    # Configure Unique Experiment ID & Log Directory.
+    # When resuming, vla_path basename already encodes the full exp_id
+    # (e.g. "openvla-7b+dataset+b16+..."); strip back to the model name
+    # before the first "+" to keep run_dir stable across resumes.
+    model_name = cfg.vla_path.split("/")[-1].split("+")[0]
     exp_id = (
-        f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
+        f"{model_name}+{cfg.dataset_name}"
         f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
         f"+lr-{cfg.learning_rate}"
     )
@@ -170,15 +175,23 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla = vla.to(device_id)
 
     # [LoRA] Wrap Model w/ PEFT `LoraConfig` =>> by default we set `target_modules=all-linear`
+    # Resume: re-attach the saved LoRA so optimizer state matches param identities.
+    # Fresh: initialize a new LoRA only on a clean run.
     if cfg.use_lora:
-        lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
-            lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
-            init_lora_weights="gaussian",
-        )
-        vla = get_peft_model(vla, lora_config)
+        adapter_safetensors = adapter_dir / "adapter_model.safetensors"
+        if adapter_safetensors.is_file():
+            vla = PeftModel.from_pretrained(vla, str(adapter_dir), is_trainable=True)
+            if distributed_state.is_main_process:
+                print(f"[resume] re-attached LoRA from {adapter_dir}")
+        else:
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=min(cfg.lora_rank, 16),
+                lora_dropout=cfg.lora_dropout,
+                target_modules="all-linear",
+                init_lora_weights="gaussian",
+            )
+            vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
@@ -187,6 +200,18 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Create Optimizer =>> note that we default to a simple constant learning rate!
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+
+    # Resume optimizer state + step counter from training_state.pt if present.
+    # For LoRA runs, training_state lives in adapter_dir (persistent across resumes).
+    # For non-LoRA runs, it's saved alongside the merged checkpoint at cfg.vla_path.
+    start_step = 0
+    training_state_path = (adapter_dir if cfg.use_lora else Path(cfg.vla_path)) / "training_state.pt"
+    if training_state_path.is_file():
+        state = torch.load(training_state_path, map_location="cpu")
+        optimizer.load_state_dict(state["optimizer"])
+        start_step = state["step"]
+        if distributed_state.is_main_process:
+            print(f"[resume] loaded optimizer + step={start_step} from {training_state_path}")
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -247,7 +272,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
 
     # Train!
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    with tqdm.tqdm(total=cfg.max_steps, initial=start_step, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -290,8 +315,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             recent_action_accuracies.append(action_accuracy.item())
             recent_l1_losses.append(action_l1_loss.item())
 
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+            # Compute gradient step index (offset by start_step on resume)
+            gradient_step_idx = (batch_idx // cfg.grad_accumulation_steps) + start_step
 
             # Compute smoothened train metrics
             #   =>> Equal to current step metrics when not using gradient accumulation
@@ -325,11 +350,19 @@ def finetune(cfg: FinetuneConfig) -> None:
                     # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
                     save_dir = adapter_dir if cfg.use_lora else run_dir
 
-                    # Save Processor & Weights
-                    processor.save_pretrained(run_dir)
+                    # Save adapter weights (small, fast). Merged save below is atomic via staging.
                     vla.module.save_pretrained(save_dir)
 
-                # Wait for processor and adapter weights to be saved by main process
+                    # Persist optimizer + step counter alongside the LoRA adapter so that resume
+                    # finds matching param identities (staging gets rename-swapped each save and
+                    # cannot host the persistent training state).
+                    if cfg.use_lora:
+                        ts_path = adapter_dir / "training_state.pt"
+                        ts_tmp = adapter_dir / "training_state.pt.tmp"
+                        torch.save({"optimizer": optimizer.state_dict(), "step": gradient_step_idx}, ts_tmp)
+                        os.replace(ts_tmp, ts_path)
+
+                # Wait for adapter weights to be saved by main process
                 dist.barrier()
 
                 # Merge LoRA weights into model backbone for faster inference
@@ -342,8 +375,25 @@ def finetune(cfg: FinetuneConfig) -> None:
                     merged_vla = merged_vla.merge_and_unload()
                     if distributed_state.is_main_process:
                         if cfg.save_latest_checkpoint_only:
-                            # Overwrite latest checkpoint
-                            merged_vla.save_pretrained(run_dir)
+                            # Atomic save: write everything to a staging dir, then rename-swap with run_dir.
+                            # If killed mid-write, old run_dir stays intact (no shard corruption).
+                            staging = run_dir.parent / (run_dir.name + ".staging")
+                            if staging.exists():
+                                shutil.rmtree(staging)
+                            staging.mkdir(parents=True)
+
+                            processor.save_pretrained(staging)
+                            save_dataset_statistics(vla_dataset.dataset_statistics, staging)
+                            merged_vla.save_pretrained(staging)
+
+                            prev = run_dir.parent / (run_dir.name + ".prev")
+                            if prev.exists():
+                                shutil.rmtree(prev)
+                            if run_dir.exists():
+                                os.rename(run_dir, prev)
+                            os.rename(staging, run_dir)
+                            if prev.exists():
+                                shutil.rmtree(prev)
 
                             print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
                         else:

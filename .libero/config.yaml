@@ -1,0 +1,5 @@
+assets: /work/pnrr_fit4medrob/VLA/LIBERO/libero/libero/assets
+bddl_files: /work/pnrr_fit4medrob/VLA/LIBERO/libero/libero/bddl_files
+benchmark_root: /work/pnrr_fit4medrob/VLA/LIBERO/libero/libero
+datasets: /work/pnrr_fit4medrob/VLA/openvla/.libero/datasets
+init_states: /work/pnrr_fit4medrob/VLA/LIBERO/libero/libero/init_files

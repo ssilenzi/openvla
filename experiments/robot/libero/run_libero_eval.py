@@ -268,6 +268,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 }
             )
 
+        # Release the env's EGL render context before atexit terminates the display
+        env.close()
+        del env
+
     # Save local log file
     log_file.close()
 
